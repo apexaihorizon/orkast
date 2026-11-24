@@ -1,4 +1,4 @@
-// orchestrator.ts — Thin Gemini CEGIS Orchestrator (delegates all parsing, sandboxing & checking to runtime.ts)
+// orchestrator.ts — Thin Gemini CEGIS Orchestrator (delegates parsing, guarding & checking to runtime.ts)
 import { GoogleGenAI, Type, type Schema } from "@google/genai";
 import type * as ESTree from "estree";
 import { compileBodyToESTree, type PrimitiveType, type RuntimeValue } from "./runtime.ts";
@@ -31,11 +31,18 @@ const BODY_SCHEMA: Schema = {
 const MODEL_POOL = [
   "gemini-3.5-flash-lite",
   "gemini-3.1-flash-lite",
-  "gemini-flash-lite-latest"
+  "gemini-flash-lite-latest",
 ];
 
 function formatVal(v: RuntimeValue): string {
   return typeof v === "number" && Number.isNaN(v) ? "NaN" : JSON.stringify(v);
+}
+
+function formatRuntimeError(err: unknown): string {
+  if (err instanceof Error) {
+    return `${err.name}: ${err.message}`;
+  }
+  return String(err);
 }
 
 async function requestBodyProposal(ai: GoogleGenAI, prompt: string): Promise<string> {
@@ -84,28 +91,34 @@ export async function orchestrateProgram(
       `Signature: ${spec.name}(${spec.params.map((p) => `${p.name}: ${p.paramType}`).join(", ")}) -> ${spec.returnType}`,
       `Intent: ${spec.description}`,
       `Tests:\n${spec.tests.map((t) => `- [${t.label}] args=${JSON.stringify(t.args)} => expected=${formatVal(t.expected)}`).join("\n")}`,
-      feedback.length > 0 ? `\nFix these exact counterexamples:\n${feedback.join("\n")}` : "",
+      feedback.length > 0 ? `\nFix these exact diagnostics/counterexamples:\n${feedback.join("\n")}` : "",
     ].join("\n");
 
     const rawBody = await requestBodyProposal(ai, prompt);
 
-    // 1. Acorn parse -> estree-walker sandbox -> astring print -> tsc type/return check -> V8 bind
+    // 1. Acorn parse -> estree-walker sandbox -> astring print -> tsc check -> guarded V8 bind
     const compiled = compileBodyToESTree(spec, rawBody);
     if (compiled.diagnostics.length > 0 || !compiled.run || !compiled.tsCode || !compiled.estree) {
-      const msg = `Attempt ${attempt} failed static/sandbox checks:\n- ${compiled.diagnostics.join("\n- ")}`;
+      const msg = `Attempt ${attempt} [STATIC_ERROR]: ${compiled.diagnostics.join(" | ")}`;
       console.log(`⚠️  ${msg}`);
       feedback.push(msg);
       continue;
     }
 
-    // 2. Edge-case runtime verification
+    // 2. Edge-case runtime verification with clinical exception capture
     const failures: string[] = [];
     for (const t of spec.tests) {
-      const actual = compiled.run(...t.args);
-      const passed = Number.isNaN(t.expected) ? Number.isNaN(actual) : actual === t.expected;
-      if (!passed) {
+      try {
+        const actual = compiled.run(...t.args);
+        const passed = Number.isNaN(t.expected) ? Number.isNaN(actual) : actual === t.expected;
+        if (!passed) {
+          failures.push(
+            `[WRONG_OUTPUT] test="${t.label}" args=${JSON.stringify(t.args)} expected=${formatVal(t.expected)} got=${formatVal(actual)}`
+          );
+        }
+      } catch (err: unknown) {
         failures.push(
-          `Test [${t.label}] failed: input=${JSON.stringify(t.args)}, expected=${formatVal(t.expected)}, got=${formatVal(actual)}`
+          `[RUNTIME_EXCEPTION] test="${t.label}" args=${JSON.stringify(t.args)} expected=${formatVal(t.expected)} error="${formatRuntimeError(err)}"`
         );
       }
     }
@@ -115,7 +128,7 @@ export async function orchestrateProgram(
       return { estree: compiled.estree, tsCode: compiled.tsCode };
     }
 
-    const failMsg = `Attempt ${attempt} failed runtime tests:\n- ${failures.join("\n- ")}`;
+    const failMsg = `Attempt ${attempt} failed:\n- ${failures.join("\n- ")}`;
     console.log(`❌ ${failMsg}`);
     feedback.push(failMsg);
   }

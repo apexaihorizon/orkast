@@ -50,6 +50,44 @@ const ALLOWED_ESTREE_NODES = new Set([
   "Literal",
 ]);
 
+const MAX_EXECUTION_STEPS = 10_000;
+
+/**
+ * Clones the ESTree and injects a deterministic loop-step guard into all loops
+ * so runaway iterations fail fast without polluting the clean output `tsCode`.
+ */
+function buildGuardedJs(estree: ESTree.Program, fnName: string, maxSteps = MAX_EXECUTION_STEPS): string {
+  const cloned = structuredClone(estree);
+  const guardAst = acorn.parse(
+    `if (++__orkastSteps > ${maxSteps}) { throw new Error("Loop step limit (${maxSteps}) exceeded — check termination condition."); }`,
+    { ecmaVersion: 2022, sourceType: "script" }
+  ).body[0] as unknown as ESTree.Statement;
+
+  walk(cloned as unknown as Parameters<typeof walk>[0], {
+    enter(node) {
+      if (node.type === "FunctionDeclaration" && node.id?.name === fnName) {
+        const counterInit = acorn.parse("let __orkastSteps = 0;", {
+          ecmaVersion: 2022,
+          sourceType: "script",
+        }).body[0] as unknown as ESTree.Statement;
+        node.body.body.unshift(counterInit);
+      } else if (node.type === "WhileStatement" || node.type === "ForStatement") {
+        const stepCheck = structuredClone(guardAst);
+        if (node.body.type === "BlockStatement") {
+          node.body.body.unshift(stepCheck);
+        } else {
+          node.body = {
+            type: "BlockStatement",
+            body: [stepCheck, node.body],
+          };
+        }
+      }
+    },
+  });
+
+  return generate(cloned);
+}
+
 export function compileBodyToESTree(meta: ProgramMeta, rawBody: string): CompileResult {
   const paramNames = meta.params.map((p) => p.name).join(", ");
   const wrappedJs = `function ${meta.name}(${paramNames}) {\n${rawBody}\n}`;
@@ -80,12 +118,12 @@ export function compileBodyToESTree(meta: ProgramMeta, rawBody: string): Compile
     return { diagnostics: [...new Set(violations)] };
   }
 
-  // 3. Canonical code printing via astring
+  // 3. Canonical code printing via astring (uninstrumented artifact)
   const cleanJs = generate(estree);
   const typedSig = `function ${meta.name}(${meta.params.map((p) => `${p.name}: ${p.paramType}`).join(", ")}): ${meta.returnType}`;
   const tsCode = cleanJs.replace(new RegExp(`^function\\s+${meta.name}\\s*\\([^)]*\\)`), typedSig);
 
-  // 4. Industrial-grade static type & return-path check via TypeScript Compiler API
+  // 4. Static type, scope & return-path check via TypeScript Compiler API (`types: []` strips Node globals)
   const fileName = "/orkast_virtual.ts";
   const options = {
     strict: true,
@@ -117,9 +155,9 @@ export function compileBodyToESTree(meta: ProgramMeta, rawBody: string): Compile
     return { estree, tsCode, diagnostics };
   }
 
-  // 5. Transpile & bind executable V8 function
-  const jsOutput = ts.transpileModule(tsCode, { compilerOptions: options }).outputText;
-  const factory = new Function(`${jsOutput}\nreturn ${meta.name};`);
+  // 5. Bind loop-guarded executable function in V8
+  const guardedJs = buildGuardedJs(estree, meta.name);
+  const factory = new Function(`"use strict";\n${guardedJs}\nreturn ${meta.name};`);
   const fn = factory() as (...args: RuntimeValue[]) => RuntimeValue;
 
   return { estree, tsCode, diagnostics: [], run: fn };
