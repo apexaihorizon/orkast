@@ -19,6 +19,9 @@ export interface RunMetrics {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  inOutRatio: string;
+  weightedTokens: number;
+  tasksPer10Usd: number;
   latencyMs: number;
   tsCode: string;
 }
@@ -210,6 +213,15 @@ function formatVal(v: RuntimeValue): string {
   return typeof v === "number" && Number.isNaN(v) ? "NaN" : JSON.stringify(v);
 }
 
+export function computeEconomics(inputTokens: number, outputTokens: number) {
+  // Based on $0.75 / 1M input and $3.75 / 1M output (5:1 output-to-input weight)
+  const weightedTokens = inputTokens + 5 * outputTokens;
+  const costUsd = (inputTokens * 0.75 + outputTokens * 3.75) / 1_000_000;
+  const tasksPer10Usd = costUsd > 0 ? Math.floor(10 / costUsd) : 0;
+  const inOutRatio = outputTokens > 0 ? `${(inputTokens / outputTokens).toFixed(2)}:1` : "N/A";
+  return { inOutRatio, weightedTokens, tasksPer10Usd };
+}
+
 export async function synthesizeWithDsl(
   spec: ProgramSpec,
   apiKey: string,
@@ -280,6 +292,7 @@ export async function synthesizeWithDsl(
     }
 
     if (failures.length === 0) {
+        const econ = computeEconomics(inputTokens, outputTokens);
       return {
         mode: "orkast-dsl",
         specName: spec.name,
@@ -287,6 +300,7 @@ export async function synthesizeWithDsl(
         inputTokens,
         outputTokens,
         totalTokens,
+        ...econ,
         latencyMs: Math.round(performance.now() - t0),
         tsCode: compiled.tsCode,
       };
