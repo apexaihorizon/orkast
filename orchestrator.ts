@@ -1,9 +1,8 @@
-// orchestrator.ts — Thin API Orchestrator (delegates all IR/AST logic to ir-bridge & runtime)
+// orchestrator.ts — Thin API Orchestrator (Flat-IR -> ESTree -> astring + tsc)
 import { GoogleGenAI, Type, type Schema } from "@google/genai";
-import type { FunctionGraph, PrimitiveType } from "./ast.ts";
-import { buildASTFromIR, type FlatProgramIR } from "./ir-bridge.ts";
-import { validateGraph } from "./validate.ts";
-import { compileGraph, type RuntimeValue } from "./runtime.ts";
+import type * as ESTree from "estree";
+import { buildESTreeFromIR, type FlatProgramIR, type PrimitiveType } from "./ir-bridge.ts";
+import { compileESTree, type RuntimeValue } from "./runtime.ts";
 
 export interface TestCase {
   label: string;
@@ -58,14 +57,18 @@ const IR_SCHEMA: Schema = {
   required: ["exprs", "stmts"],
 };
 
+function formatVal(v: RuntimeValue): string {
+  return typeof v === "number" && Number.isNaN(v) ? "NaN" : JSON.stringify(v);
+}
+
 export async function orchestrateProgram(
   spec: ProgramSpec,
   apiKey: string,
   maxAttempts = 4
-): Promise<{ graph: FunctionGraph; tsCode: string }> {
+): Promise<{ estree: ESTree.Program; tsCode: string }> {
   const ai = new GoogleGenAI({ apiKey, apiVersion: "v1beta" });
   const feedback: string[] = [];
-
+  const models = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", ]
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     console.log(`\n🔄 Attempt ${attempt}/${maxAttempts}: Requesting Flat-IR...`);
 
@@ -76,12 +79,12 @@ export async function orchestrateProgram(
       "- Order `IF_RET` checks from lowest/strictest boundary up, and ALWAYS end `stmts` with a final `RET`.",
       `Signature: ${spec.name}(${spec.params.map((p) => `${p.name}: ${p.paramType}`).join(", ")}) -> ${spec.returnType}`,
       `Intent: ${spec.description}`,
-      `Tests:\n${spec.tests.map((t) => `- [${t.label}] args=${JSON.stringify(t.args)} => expected=${JSON.stringify(t.expected)}`).join("\n")}`,
+      `Tests:\n${spec.tests.map((t) => `- [${t.label}] args=${JSON.stringify(t.args)} => expected=${formatVal(t.expected)}`).join("\n")}`,
       feedback.length > 0 ? `\nFix these exact counterexamples:\n${feedback.join("\n")}` : "",
     ].join("\n");
 
     const response = await ai.models.generateContent({
-      model: "gemini-flash-lite-latest",
+      model: models[0],
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       config: { responseMimeType: "application/json", responseSchema: IR_SCHEMA, temperature: 0.1 },
     });
@@ -89,40 +92,39 @@ export async function orchestrateProgram(
     if (!response.text) throw new Error("Empty model response.");
     const ir = JSON.parse(response.text) as FlatProgramIR;
 
-    // 1. Deterministic IR -> AST Bridge
-    const { graph, errors: bridgeErrors } = buildASTFromIR(spec, ir);
-    if (!graph || bridgeErrors.length > 0) {
+    // 1. Flat-IR -> Standard ESTree
+    const { estree, errors: bridgeErrors } = buildESTreeFromIR(spec, ir);
+    if (!estree || bridgeErrors.length > 0) {
       const msg = `Attempt ${attempt} failed IR bridge:\n- ${bridgeErrors.join("\n- ")}`;
       console.log(`⚠️  ${msg}`);
       feedback.push(msg);
       continue;
     }
 
-    // 2. Deterministic Static Validation
-    const staticErrors = validateGraph(graph);
-    if (staticErrors.length > 0) {
-      const msg = `Attempt ${attempt} failed static validation:\n- ${staticErrors.join("\n- ")}`;
+    // 2. astring codegen + TypeScript Compiler API static check + V8 bind
+    const compiled = compileESTree(spec, estree);
+    if (compiled.diagnostics.length > 0 || !compiled.run || !compiled.tsCode) {
+      const msg = `Attempt ${attempt} failed TypeScript diagnostics:\n- ${compiled.diagnostics.join("\n- ")}`;
       console.log(`⚠️  ${msg}`);
       feedback.push(msg);
       continue;
     }
 
-    // 3. Deterministic Compile + Test Execution
-    const compiled = compileGraph(graph);
+    // 3. Edge-case runtime verification
     const failures: string[] = [];
     for (const t of spec.tests) {
       const actual = compiled.run(...t.args);
       const passed = Number.isNaN(t.expected) ? Number.isNaN(actual) : actual === t.expected;
       if (!passed) {
         failures.push(
-          `Test [${t.label}] failed: input=${JSON.stringify(t.args)}, expected=${JSON.stringify(t.expected)}, got=${JSON.stringify(actual)}`
+          `Test [${t.label}] failed: input=${JSON.stringify(t.args)}, expected=${formatVal(t.expected)}, got=${formatVal(actual)}`
         );
       }
     }
 
     if (failures.length === 0) {
       console.log(`✅ All ${spec.tests.length} tests passed on attempt ${attempt}!`);
-      return { graph, tsCode: compiled.tsCode };
+      return { estree, tsCode: compiled.tsCode };
     }
 
     const failMsg = `Attempt ${attempt} failed runtime tests:\n- ${failures.join("\n- ")}`;
@@ -130,5 +132,5 @@ export async function orchestrateProgram(
     feedback.push(failMsg);
   }
 
-  throw new Error(`Failed to synthesize verified graph within ${maxAttempts} attempts.`);
+  throw new Error(`Failed to synthesize verified ESTree graph within ${maxAttempts} attempts.`);
 }

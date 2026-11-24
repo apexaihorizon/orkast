@@ -27,9 +27,9 @@ async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
 
-  const { tsCode, graph } = await orchestrateProgram(taxSlabSpec, apiKey);
+  const { tsCode, estree } = await orchestrateProgram(taxSlabSpec, apiKey);
   console.log("\n--- Synthesized & Verified TypeScript ---\n" + tsCode);
-  console.log("\n--- Raw AST Block Count ---", graph.body.length);
+  console.log("\n--- Raw AST Block Count ---", estree.body.length);
 }
 
 main();

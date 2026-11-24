@@ -1,5 +1,7 @@
-// ir-bridge.ts — Immutable Flat-IR to AST Bridge (Zero AI dependencies)
-import type { ExprBlock, FunctionGraph, PrimitiveType, StmtBlock } from "./ast.ts";
+// ir-bridge.ts — Flat-IR to Standard ESTree AST Bridge (for astring + TypeScript Compiler API)
+import type * as ESTree from "estree";
+
+export type PrimitiveType = "number" | "boolean" | "string";
 
 export interface IRExprNode {
   id: string;
@@ -8,7 +10,7 @@ export interface IRExprNode {
   str?: string;
   bool?: boolean;
   name?: string;
-  op?: Extract<ExprBlock, { kind: "BINARY_OP" }>["op"];
+  op?: ESTree.BinaryOperator | ESTree.LogicalOperator;
   left?: string;
   right?: string;
 }
@@ -26,10 +28,18 @@ export interface FlatProgramIR {
   stmts: IRStmtNode[];
 }
 
-export function buildASTFromIR(
-  meta: { name: string; params: Array<{ name: string; paramType: PrimitiveType }>; returnType: PrimitiveType },
+export interface ProgramMeta {
+  name: string;
+  params: Array<{ name: string; paramType: PrimitiveType }>;
+  returnType: PrimitiveType;
+}
+
+const LOGICAL_OPS = new Set(["&&", "||", "??"]);
+
+export function buildESTreeFromIR(
+  meta: ProgramMeta,
   ir: FlatProgramIR
-): { graph?: FunctionGraph; errors: string[] } {
+): { estree?: ESTree.Program; errors: string[] } {
   const errors: string[] = [];
   const exprPool = new Map<string, IRExprNode>();
 
@@ -39,10 +49,10 @@ export function buildASTFromIR(
     else exprPool.set(e.id, e);
   }
 
-  const resolved = new Map<string, ExprBlock>();
+  const resolved = new Map<string, ESTree.Expression>();
   const visiting = new Set<string>();
 
-  function resolveExpr(id?: string): ExprBlock | null {
+  function resolveExpr(id?: string): ESTree.Expression | null {
     if (!id) {
       errors.push("Missing expression reference id.");
       return null;
@@ -60,70 +70,111 @@ export function buildASTFromIR(
     }
 
     visiting.add(id);
-    let block: ExprBlock | null = null;
+    let expr: ESTree.Expression | null = null;
 
     switch (node.kind) {
       case "NUM":
         if (typeof node.num !== "number" || Number.isNaN(node.num)) {
           errors.push(`NUM node '${id}' requires valid 'num'.`);
+        } else if (node.num < 0) {
+          expr = {
+            type: "UnaryExpression",
+            operator: "-",
+            prefix: true,
+            argument: { type: "Literal", value: Math.abs(node.num) },
+          };
         } else {
-          block = { kind: "LITERAL", valueType: "number", value: node.num };
+          expr = { type: "Literal", value: node.num };
         }
         break;
       case "STR":
         if (typeof node.str !== "string") errors.push(`STR node '${id}' requires 'str'.`);
-        else block = { kind: "LITERAL", valueType: "string", value: node.str };
+        else expr = { type: "Literal", value: node.str };
         break;
       case "BOOL":
         if (typeof node.bool !== "boolean") errors.push(`BOOL node '${id}' requires 'bool'.`);
-        else block = { kind: "LITERAL", valueType: "boolean", value: node.bool };
+        else expr = { type: "Literal", value: node.bool };
         break;
       case "VAR":
         if (!node.name) errors.push(`VAR node '${id}' requires 'name'.`);
-        else block = { kind: "VAR_REF", name: node.name };
+        else expr = { type: "Identifier", name: node.name };
         break;
       case "BIN_OP": {
-        const l = resolveExpr(node.left);
-        const r = resolveExpr(node.right);
-        if (!node.op) errors.push(`BIN_OP node '${id}' requires 'op'.`);
-        else if (l && r) block = { kind: "BINARY_OP", op: node.op, left: l, right: r };
+        const left = resolveExpr(node.left);
+        const right = resolveExpr(node.right);
+        if (!node.op) {
+          errors.push(`BIN_OP node '${id}' requires 'op'.`);
+        } else if (left && right) {
+          expr = LOGICAL_OPS.has(node.op)
+            ? { type: "LogicalExpression", operator: node.op as ESTree.LogicalOperator, left, right }
+            : { type: "BinaryExpression", operator: node.op as ESTree.BinaryOperator, left, right };
+        }
         break;
       }
     }
 
     visiting.delete(id);
-    if (block) resolved.set(id, block);
-    return block;
+    if (expr) resolved.set(id, expr);
+    return expr;
   }
 
-  const body: StmtBlock[] = [];
+  const body: ESTree.Statement[] = [];
   for (const s of ir.stmts ?? []) {
     const val = resolveExpr(s.expr);
     switch (s.kind) {
       case "LET":
-        if (!s.name || !s.varType) errors.push("LET statement requires 'name' and 'varType'.");
-        else if (val) body.push({ kind: "DECLARE", name: s.name, varType: s.varType, init: val });
+        if (!s.name) errors.push("LET statement requires 'name'.");
+        else if (val) {
+          body.push({
+            type: "VariableDeclaration",
+            kind: "let",
+            declarations: [{ type: "VariableDeclarator", id: { type: "Identifier", name: s.name }, init: val }],
+          });
+        }
         break;
       case "SET":
         if (!s.name) errors.push("SET statement requires 'name'.");
-        else if (val) body.push({ kind: "ASSIGN", name: s.name, value: val });
+        else if (val) {
+          body.push({
+            type: "ExpressionStatement",
+            expression: {
+              type: "AssignmentExpression",
+              operator: "=",
+              left: { type: "Identifier", name: s.name },
+              right: val,
+            },
+          });
+        }
         break;
       case "IF_RET": {
         const cond = resolveExpr(s.cond);
         if (cond && val) {
-          body.push({ kind: "IF_ELSE", condition: cond, thenBranch: [{ kind: "RETURN", value: val }] });
+          body.push({
+            type: "IfStatement",
+            test: cond,
+            consequent: { type: "BlockStatement", body: [{ type: "ReturnStatement", argument: val }] },
+            alternate: null,
+          });
         }
         break;
       }
       case "RET":
-        if (val) body.push({ kind: "RETURN", value: val });
+        if (val) body.push({ type: "ReturnStatement", argument: val });
         break;
     }
   }
 
   if (errors.length > 0) return { errors };
+
+  const fnDecl: ESTree.FunctionDeclaration = {
+    type: "FunctionDeclaration",
+    id: { type: "Identifier", name: meta.name },
+    params: meta.params.map((p) => ({ type: "Identifier", name: p.name })),
+    body: { type: "BlockStatement", body },
+  };
+
   return {
-    graph: { name: meta.name, params: meta.params, returnType: meta.returnType, body },
+    estree: { type: "Program", sourceType: "script", body: [fnDecl] },
     errors: [],
   };
 }
