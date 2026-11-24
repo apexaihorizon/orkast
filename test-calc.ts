@@ -1,9 +1,6 @@
 // test-calc.ts — Regression & generalization check on the frozen Orkast pipeline
 // Run with: node --env-file=.env test-calc.ts
-import * as readline from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
 import { orchestrateProgram, type ProgramSpec } from "./orchestrator.ts";
-import { compileGraph } from "./runtime.ts";
 
 const calcSpec: ProgramSpec = {
   name: "calculate",
@@ -33,43 +30,11 @@ const calcSpec: ProgramSpec = {
 
 async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("Missing GEMINI_API_KEY in .env");
+  if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
 
-  const { graph, tsCode } = await orchestrateProgram(calcSpec, apiKey);
-  const program = compileGraph(graph);
-
+  const { tsCode, estree } = await orchestrateProgram(calcSpec, apiKey);
   console.log("\n--- Synthesized & Verified TypeScript ---\n" + tsCode);
-  console.log("--- Raw AST Block Count ---", graph.body.length, "\n");
-
-  const rl = readline.createInterface({ input, output });
-  console.log("Interactive Calculator Ready (type 'exit' to quit).\n");
-
-  while (true) {
-    const rawA = (await rl.question("First number (a): ")).trim();
-    if (rawA.toLowerCase() === "exit") break;
-
-    const op = (await rl.question("Operator (+, -, *, /, %): ")).trim();
-    if (op.toLowerCase() === "exit") break;
-
-    const rawB = (await rl.question("Second number (b): ")).trim();
-    if (rawB.toLowerCase() === "exit") break;
-
-    const a = Number(rawA);
-    const b = Number(rawB);
-    if (Number.isNaN(a) || Number.isNaN(b)) {
-      console.log("⚠️  Enter valid numbers.\n");
-      continue;
-    }
-
-    const res = program.run(a, op, b);
-    if (typeof res === "number" && Number.isNaN(res)) {
-      console.log("❌ Invalid operation (unknown operator or zero divisor).\n");
-    } else {
-      console.log(`✅ Result: ${a} ${op} ${b} = ${res}\n`);
-    }
-  }
-
-  rl.close();
+  console.log("\n--- Raw AST Block Count ---", estree.body.length);
 }
 
 main();
